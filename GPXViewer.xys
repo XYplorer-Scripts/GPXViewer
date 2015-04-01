@@ -1,0 +1,706 @@
+/*#############################################################################\
+GPXViewer.xys
+
+Displays a map with GPX files.
+
+[ABOUT]
+Author    = TheQwerty
+Version   = 0.1
+Date      = 2015-04-01 17:42z
+Requires  = XYplorer v15.00.0000
+
+[]
+\#############################################################################*/
+
+
+/*******************************************************************************
+** View GPX
+**   Displays a map with the specified, selected, or listed GPX files.
+*******************************************************************************/
+"&View GPX||1 : viewGPX"
+// ----- PARAMETERS ----------------------------------------------------------
+  // IN: G_ITEMS [optional]
+  //   A |-separated list of GPX files to view.
+  //   If omitted the selection is used.
+  //   If nothing is selected the list contents will be used.
+	Global $G_ITEMS;
+  // ----- END PARAMETERS ------------------------------------------------------
+
+  // Get options.
+	Sub '_getOptions';
+	Global $G_GPX_LIMIT, $G_WINDOW_SIZE, $G_AUTOSAVE_HTML, $G_SAVE_HTML_AS, $G_PROMPT_TO_SAVE;
+
+
+	$sep = '|';
+
+	// Get items.
+	if ($G_ITEMS != '') {
+		$items = ReplaceList($G_ITEMS, "| <crlf>", $sep, ' ');
+		$items = FormatList($items, 'det', $sep);
+	} elseif (Get('CountSelected') > 0) {
+		$items = Get('SelectedItemsPathNames', $sep);
+	} else {
+		$items = ListPane('a', '*', 1, $sep);
+	}
+
+	// Filter to GPX files.
+	$gpxFiles = FormatList($items, 'deft', $sep, '*.gpx');
+
+	// End if there's nothing to see...
+	$gpxFileCount = GetToken($gpxFiles, 'Count', $sep);
+	End $gpxFileCount < 1, 'No GPX files to display.';
+
+	// Cap the number of files - otherwise building the HTML can freeze XY.
+	if ($gpxFileCount > $G_GPX_LIMIT) {
+		$gpxFiles = GetToken($gpxFiles, $G_GPX_LIMIT, $sep,, 1);
+	}
+
+	// Read in the GPX files contents.
+	$gpxContent = '';
+	foreach ($file, $gpxFiles, $sep) {
+		if ($file == '') { continue; }
+
+		$content = ReadFile($file, 't');
+		// Replace new lines.
+		$content = RegexReplace($content, '\r?\n');
+		// Escape single quotes.
+		$content = Replace($content, "'", "\'");
+		// Trim whitespace.
+		$content = Trim($content, " <tab><crlf>");
+
+		if ($content != '') {
+			$gpxContent = $gpxContent . "'" . $content . "',<crlf>				";
+		}
+	}
+
+	// Build up the HTML document.
+	$html = <<<HTMLDOCUMENT
+<!DOCTYPE html>
+<html>
+	<head>
+		<title>GPX XY Example</title>
+		<meta http-equiv="x-ua-compatible" content="IE=edge" />
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1.0">
+		<!-- Leaflet Style -->
+		<link rel="stylesheet" href="http://cdn.leafletjs.com/leaflet-0.7.3/leaflet.css" />
+		<!-- Leaflet.Elevation Style -->
+		<link rel="stylesheet" href="https://cdn.rawgit.com/MrMufflon/Leaflet.Elevation/master/dist/Leaflet.Elevation-0.0.2.css" />
+	</head>
+	<body>
+		<div id="map" style="width: 600px; height: 500px"></div>
+		<ul class="info">
+			<li>Layer:&nbsp;<span id="name"></span></li>
+			<li>Dates:&nbsp;<span id="date-start"></span>&nbsp;&mdash;&nbsp;<span id="date-end"></span></li>
+			<li>Distance:&nbsp;<span id="distance"></span>&nbsp;km</li>
+			<li>Points:&nbsp;<span id="markers"></span></li>
+			<li>Duration:&nbsp;<span id="duration"></span>&nbsp;(moving:&nbsp;<span id="duration-moving"></span>)</li>
+			<li>Average Pace:&nbsp;<span id="pace"></span>/km</li>
+			<li>Average Speed:&nbsp;<span id="speed"></span>&nbsp;km/h</li>
+			<li>Elevation:&nbsp;+<span id="elevation-gain"></span>&nbsp;m, -<span id="elevation-loss"></span>&nbsp;m (net:&nbsp;<span id="elevation-net"></span>&nbsp;m)</li>
+		</ul>
+
+		<!-- Leaflet -->
+		<script src="http://cdn.leafletjs.com/leaflet-0.7.3/leaflet.js"></script>
+		<!-- Leaflet-gpx -->
+		<script src="https://rawgit.com/TheQwerty/leaflet-gpx/xyie/gpx.js"></script>
+		<!-- Leaflet.Elevation -->
+		<script src="http://d3js.org/d3.v3.min.js" charset="utf-8"></script>
+		<script type="text/javascript" src="https://cdn.rawgit.com/MrMufflon/Leaflet.Elevation/master/dist/Leaflet.Elevation-0.0.2.min.js"></script>
+
+		<script>
+			// Updates a span's textContent.
+			var setSpanText = function(sid, v) {
+				var span = document.getElementById(sid);
+				while (span.firstChild) { span.removeChild(span.firstChild); }
+				span.appendChild(document.createTextNode(v));
+			};
+
+			// Converts a time to the locale string.
+			var formatDateTime = function(d) { return d ? d.toLocaleString() : ''; };
+
+			// Tracks the visible layers and updates the map to show them.
+			var updateVisibleLayers = function(l, add, el) {
+				if (add) {
+					updateLayerDetails(l);
+					visibleLayers.addLayer(l);
+				} else {
+					visibleLayers.removeLayer(l);
+				}
+
+				el && el.clear();
+				if (visibleLayers.getLayers().length > 0) {
+					map.fitBounds(visibleLayers.getBounds());
+					for (var i=0, c=visibleLayers.getLayers().length; i < c; i++) {
+						var layer = visibleLayers.getLayers()[i];
+						el.addData(layer, layer);
+					}
+				}
+			};
+
+			// Updates the track detail fields.
+			var updateLayerDetails = function(l) {
+				setSpanText('name', l.get_name());
+				setSpanText('date-start', formatDateTime(l.get_start_time()));
+				setSpanText('date-end', formatDateTime(l.get_end_time()));
+				setSpanText('distance', (l.get_distance() / 1000).toFixed(2));
+				setSpanText('duration', l.get_duration_string(l.get_total_time()));
+				setSpanText('duration-moving', l.get_duration_string(l.get_moving_time()));
+				setSpanText('pace', l.get_duration_string(l.get_moving_pace(), true));
+				setSpanText('speed', l.get_moving_speed().toFixed(2));
+				setSpanText('markers', l.get_point_count());
+				setSpanText('elevation-gain', l.get_elevation_gain().toFixed(0));
+				setSpanText('elevation-loss', l.get_elevation_loss().toFixed(0));
+				setSpanText('elevation-net', (l.get_elevation_gain() - l.get_elevation_loss()).toFixed(0));
+			};
+
+			// Creates a GPX overlay
+			var createGpxOverlay = function(gpx, lcl) {
+				// Add our GPX data as a layer.
+				return new L.GPX(gpx, {
+					async:false,
+					marker_options: {
+						startIconUrl: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACEAAAAyCAMAAADleEJoAAAAGXRFWHRTb2Z0d2FyZQBBZG9iZSBJbWFnZVJlYWR5ccllPAAAAWhQTFRFRIQT////RIQTRIQTRIQTRIQTRIQTRIQTRIQTR4YVSYgWRIQTTIsZS4oYRIQTRIQTRYUURIQTRIQTRIQTRIQTTIsZRIQTR4YVRIQTVZMgRIQTSokXVZIfWZYjWpcjRIQTRIQTbacxRIQTSIcWd684X5snT40bc6w1RIQTSIgWh71ERIQTerI6To0bVJIfWpcjRIQTRIQTRG4dRHEbRIQTRoYVSXEfSnYfSokXTXUiTYwaUH0jUY8cUoghUpAdU3wnV5QhWYgoWpcjW4EzW5EmXJklYoU8YpMuYp0pY54qZJwrZ5cxZ6IsaKIta6UwbKQwbKYwbqcxb6gycpBSdK02erI6gLc/gpxqhrxDi8BHjMFHjsBPjsJJkMRKkMVKlchOmcxRmshenc9UoNJWqb2SrNR3t8anvdievd2RyNK9yN6rzdXF1+fE2N/R3+vQ7Ozs8PLt8fHx8vjp9Pfw9fX1+vr6/f39////ZRAX+wAAADJ0Uk5TAAALFiItOENPT09aZHl7goKGjKStusLCyMjOzs7Oztre3uHh4uPk5Ozz8/X19vb3/P7XCCZCAAABoUlEQVQ4y83UaVOCQBjA8W1phUTSSlO7NDtFzQ66b8vu+7DL0rL7vv362S7Cggjvmv7vHuY3MAPPAiqsAn8ngBy08dU11bwNFi/oBCM0taaOT49TrU0CYyS4FjFXTGzhSoXQnqNrF/RCEHPaREEr2K6cvi6WFrA5e6Ev2wwp4YhmS4s6KOFPZ3Dvtxm1tF8VlR1npHz++epMqaNSEezWESlf6PFcHo62WEXwO4ekPO7+hEw7vCo2UqRv0scNnjYosbZP+iK9Xq7+TmuqQPE90ifuem568XeKI0XAzm3SW6G7hdHZTTx1QvV9eJbXcS8vD7tD4ytkWPZQb8zes4R7Ougfnl+S67HTX64xkcQNTCaLJRo137YqNqMvVqXdD+/ElLYJr26DUNuYtjak30JXeIQu7CrZU+gbpPPB0l23BSW1oM3ovNRSotbwRMEGBTRAQwG4bhl0c8anEgC3LNygnEAhDEKorAB1WNSB8gLfRL2FgQD1BVEPzAQXkSKcqWACUoAxFYXHUA8xFE7JaSG4Xs5CoD5kIUANsBLIUPyXP79pPwK/oqonPeNcAAAAAElFTkSuQmCC',
+						endIconUrl:   'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACEAAAAyCAMAAADleEJoAAAAGXRFWHRTb2Z0d2FyZQBBZG9iZSBJbWFnZVJlYWR5ccllPAAAASZQTFRFwyYm////wyYmwyYmwyYmwyYmwyYmwyYmwyYmxioqxywswyYmyDAwxy4uwyYmxCYmxScnwyYmxCYmxSYmxSYmyTAwxSYmxikpxScnzjs7xSYmyS0tzjs70EBA0UFBxiYmxyYm3VhYxyYmySsr42Rk1UhIyzMz4V9fyScnzCws7Xd3yScn5WhozjMz0To600FByScnyCYmnDk5nj4+oUREo0lJpU1Np1JSqVdXyicnyycnzCcnzScnzioq0C4u0jIy0zY21Dg41z4+2EFB2kRE3ExM3FFR3UtL3VdX3lZW4FJS4Fpa41lZ5mFh6Who6W9v6urq7G9v73Z28H198PDw8n1984CA84KC9YOD94iI9/f3+Y2N+Y6O+5KS/Pz8/ZWV/ZaW////bORD8gAAADJ0Uk5TAAALFiItOENPT09aZHl7goKGjKStusLCyMjOzs7Oztre3uHh4uPk5Ozz8/X19vb3/P7XCCZCAAABfElEQVQ4y83U11LCQBSA4XVhSSih9yK9hWYvgIoiCKKioliw4Pu/hJoTkk2B3Dn+Vxzmm4RJzoLWjEJ/J5AYttidHqfdghdfqISJi6fHk6fJOB3nTHqCXefni/h1Viu43Jwux6kFx8+V8ZxSMMVPdUWGFjgxe1c3S2BKOKpv2qoOSkSmL9qmEVmY88/QFyROebMkmMEjJIoDmAaMJOyje0gU+zCN7LIY3kEf0B5MQ0r0b6BXaBemvixI4xp6gHZgahBJ4MIVdAttw1TA8vMI9C6hLUj43AtQT8xWv9BWt9FvLtY9V9eNKd6ttXamrmZV7keoc6qsE1JtEMmeKMsS9Ra6y8d0ZbdmT3H4iC6MtbtuSbXlUha98+JtSqDp1T1ROCqJKNYViC2JoMTqn0qE/C0BtPxomSAZQWTIUoF8vz+26UPLhXAR+RI6AgVb7VYQrRJspV1hVwpTsp00rRQ/t6Fuoitchy4DwW6wBoJsEgOBPMhIEF3xX/75V/YN5QibzelgLDcAAAAASUVORK5CYII=',
+						shadowUrl:    'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADIAAAAyCAQAAAC0NkA6AAAAGXRFWHRTb2Z0d2FyZQBBZG9iZSBJbWFnZVJlYWR5ccllPAAABElJREFUWMPt2EuPFVUQAOA6dR79uI+ZUZiECRlZEKOyIQ5rw8INYa17N/4N+T2ydS+uCUhMNG6EQYgEB5zHvd19HvVwcQExYebOSFxopnvTSXfX19XnnK5KG4V/f0M4RU6RU+QUOUVOkVPk/4i4w06Yk8VZXP7GrkQPR44RFMG82l/GE9BX+/JMDg1uwGxhNB1mLKhGjBo1agAWB1YqruU831qAi5v0+K/LAG7hPq7YiGPsbUFCRkHGfpGLoozFcUNTEjrgj/imggDosREEc8lObWWdVQcObbLZFttZwYhgBAGMIjc8oabUqc2cawK+KaDHQwwYsBfsyF3wwU88enLsep9d76JNNtmCGwjwmwSuaDWP42o/GWjYzWu0wTdk+cC/ADo38evBhWnACisO5EeewnP/xKlly/gEAYxYPpvX06jzDmEqJI9kV5YPvAEEu+H2/buhrVyNdWzONKW+XeVQfPLk2AoyAoIBIBF5lmfD1H0ipuyVWMa0Y46FbLiuWq3bWlpqoX3Y3m64pkA+O3ZsBcGIgcXsEmVyAPNyL1z0M5twz0yWTmEDeN7NqklrRzS6OLk3Tq3UUlNVnFqxBQHFyMtVoigAgmLUPDOb8FQ7OIA7AAb0SOSi/cOv1jh203ry3dSMSqMVB/GABV/ksJh6CoqCLIRFckl1upuFLIfF0jw6k4hnQmg3Jw9WHk55QiOu2IMV+7fnVxQUYEtQTJIe52fnTzuNXBraebEcD0fMVQMW3Er1a/v7iMc04qYEQcCXACoICrJny1BMkawDdOuzvX2dUd+leQFehsDMfIDgyD+vXE2VBvbiXgccW0b2ZIsjyZo0lv69+c5M59R1A2RgWJoJbMGamZifrXfisgMrKLgAUJAtO7IlkMsua7YpDR8O0j/oXNcPXYQC9Ne360gkaYFNuAu0KDsGFGGRgaNQbK6yzz75yPHj4WDYi/sDxC6O8pxeJ45AFG7pgSbx/D7/oEGzOgFAteQolJCr7GMVTdwazg3z2EUfbeJcl7WyzSCvE0cVLf0Wplp00FW1asWKkEGkuoTsUh3rwQ/XhqY3UQZOJacCpaNtflVR4Jj1ZB2ea6ONes7sC6pRW5oUYjvY/np/pnd9iDGlPC9ShGey/QZgCXIVfoIWnFpx7EpruADXqe5Df7071497P4TECct9esw7ckveFH7ZmBgw6+aRCWA4FIlEAJjDcG2+0a31oz5Emw9yR8SP5ZLeOBQ4RvkVRSnkE4oa5MvpSlfN3+lXI8aUgXZ5Tb4QgJv6D7sVgDswhh72ZDv7waZWrpUwTPpp30RIQBO6L1+K0bdqiQAAnsGuzApFoE91RFVZiWsDpklp6Ef+TK7oW/ddYAA6Qf4lbepl03HLTYEEudCMv5Gv1Jzgz8/h15pb9nufQ/TeZq244SljyfyETwYc2a2A+Rwv2X2b7NjMlWRDQH7kr8Wc+N/VUch/reH+E4d5t00+dwaQAAAAAElFTkSuQmCC'
+					}
+				}).on('loaded', function(e) {
+					lcl.addOverlay(e.target, e.target.get_name());
+				}).on('click', function(e) {
+					onClick(e, e.target);
+				});
+			};
+
+			// Finds latlngs within an array (a) which are within d meters of latlng (m).
+			var findNearbyPoints = function(a, m, d) {
+				if (a && a.filter) {
+					return a.filter(function(ie) { return ie.distanceTo(m.latlng) < d; });
+				} else {
+					var items = [];
+					for (var i = 0; i < a.length; i++) {
+						if (a[i].distanceTo(m.latlng) < d) {
+							items.push(a[i]);
+						}
+					}
+					return items;
+				}
+			};
+
+			// Updates the popup.
+			var onClick = function(e, t) {
+				var msg = e.latlng.toString();
+
+				// If the layer has a name add it.
+				if (t.get_name) {
+					msg += '<br/><br/><b>' + t.get_name() + '</b>';
+				}
+
+				// If the layer has latlngs show a list of nearby points.
+				if (t._latlngs) {
+					var distance = 20;
+					var matching = findNearbyPoints(t._latlngs, e, distance);
+
+					if (matching.length > 0) {
+						msg += '<br/><br />Nearby Points (<' + distance + 'm)<br/>'
+						for (var idx in matching) {
+							var ll = matching[idx];
+
+							// Include the time.
+							if (ll.meta && ll.meta.time) {
+								msg += ll.meta.time.toLocaleString() + ' - ';
+							}
+
+							msg += ll.toString();
+
+							// Include the elevation.
+							if (ll.meta && ll.meta.ele) {
+								msg += ' @ ' + ll.meta.ele + 'm';
+							}
+
+							msg += '<br/>';
+						}
+					}
+				}
+
+				// Update the popup.
+				popup
+					.setLatLng(e.latlng)
+					.setContent(msg)
+					.openOn(map);
+			};
+
+
+			// Construct the map.
+			var map = L.map('map').fitWorld();
+			var popup = L.popup({maxWidth:500});
+
+			// Control which layers are visible.
+			var lcl = L.control.layers(null, null, {'position':'topleft'});
+			var visibleLayers = L.featureGroup().addTo(map);
+
+			var el = L.control.elevation({
+				position: 'bottomright',
+				theme: 'purple-theme',
+				width: 300,
+				height: 100,
+				useHeightIndicator: true,
+				collapsed: false
+			}).addTo(map);
+
+			// Add our tile provider.
+			L.tileLayer('http://{s}.tile.osm.org/{z}/{x}/{y}.png', {
+				attribution: 'Map data © <a href="http://openstreetmap.org">OpenStreetMap</a> contributors'
+			}).addTo(map);
+
+			// Add our map events.
+			map.on('overlayadd', function(e) {
+					updateVisibleLayers(e.layer, true, el);
+				})
+				.on('overlayremove', function(e) {
+					updateVisibleLayers(e.layer, false, el);
+				})
+				.on('click', function(e) {
+					onClick(e, map);
+			});
+
+
+			// Add the GPX Layers...
+			var gpxList = [
+				// GPX_CONTENT_GOES_HERE
+				$gpxContent
+			];
+
+			for (var idx in gpxList) {
+				var layer = createGpxOverlay(gpxList[idx], lcl);
+
+				// Make the first layer visible...
+				if (idx == 0) {
+					layer.once('loaded', function(e) {
+						e.target.addTo(map);
+						updateVisibleLayers(e.target, true, el);
+					});
+				}
+			}
+
+			if (gpxList.length > 1) {
+				lcl.addTo(map);
+			}
+		</script>
+	</body>
+</html>
+HTMLDOCUMENT;
+
+	// The crap we do to get some decent rendering from WebBrowser :rolls:
+  // To get it to obey the x-ua-compatible the content must be saved to a file.
+	$tempFile = "%tmp%\GPXViewer-<date yyyymmddhhnnss>.html";
+	$wrote = WriteFile($tempFile, $html, 'o');
+	End $wrote == 0, "Could not write temp file:<crlf>$tempFile";
+
+	// Determine window size.
+	$width  = GetToken($G_WINDOW_SIZE, 1, 'x', 't');
+	$height = GetToken($G_WINDOW_SIZE, 2, 'x', 't');
+	$caption = 'GPX Viewer';
+
+	// Display HTML.
+	$res = html($tempFile, $width, $height, $caption);
+
+	// Delete temp file.
+	delete 1, 0, $tempFile;
+
+	// Save generated HTML if desired.
+	if ($G_AUTOSAVE_HTML || $G_PROMPT_TO_SAVE) {
+		// Determine auto-save template.
+		set $saveFile, $G_SAVE_HTML_AS, 'r';
+		$saveFile = ResolvePath($saveFile, "<curpath>\", 0);
+
+		// Prompt to save overrides autosave settings.
+		if ($G_PROMPT_TO_SAVE) {
+			// Default to current path if option offers no better alternative.
+			$savePath = GetPathComponent($saveFile, 'path');
+			if (Exists($savePath) LikeI '0*') {
+				$savePath = <curpath>;
+			}
+
+			// Prompt user.
+			$saveFile = InputFile($savePath, 'html', 'Save Generated HTML');
+		}
+
+		// Write file.
+		$wrote = WriteFile($saveFile, $html, 'r');
+		if ($wrote LikeI '*|*') {
+			$saveFile = GetToken($wrote, 2, '|');
+			$wrote = GetToken($wrote, 1, '|');
+		}
+
+		// Provide feedback.
+		if ($wrote > 0) {
+			Status 'Saved generated HTML to: ' . $saveFile,, 'ready';
+		} else {
+			Status 'Error: Could not save file!',, 'alert';
+		}
+	}
+/**************************************************************** END viewGPX */
+
+
+"- : _-" //---------------------------------------------------------------------
+"- : _-" //---------------------------------------------------------------------
+
+
+/*******************************************************************************
+** Display Current Settings
+**   Shows the current script configuration settings.
+*******************************************************************************/
+"&Display Current Settings : _showOptions"
+  // Get Defaults
+  Sub '_getDefaults';
+	Global $G_GPX_LIMIT, $G_WINDOW_SIZE, $G_AUTOSAVE_HTML, $G_SAVE_HTML_AS, $G_PROMPT_TO_SAVE;
+
+	$dLimit = $G_GPX_LIMIT;
+	$dWidth = GetToken($G_WINDOW_SIZE, 1, 'x', 't');
+	$dHeight = GetToken($G_WINDOW_SIZE, 2, 'x', 't');
+	$dAutoSave = $G_AUTOSAVE_HTML;
+	$dSaveAs = $G_SAVE_HTML_AS;
+	$dSavePrompt = $G_PROMPT_TO_SAVE;
+
+  // Get Current
+  Sub '_getOptions';
+
+  $defaultMarker = "<tab>[DEFAULT]";
+
+  // Split window size.
+  $cWidth = GetToken($G_WINDOW_SIZE, 1, 'x', 't');
+  $dWidth = $cWidth == $dWidth ? $defaultMarker : '';
+
+  $cHeight = GetToken($G_WINDOW_SIZE, 2, 'x', 't');
+  $dHeight = $cHeight == $dHeight ? $defaultMarker : '';
+
+  // Limit
+  $dLimit = $G_GPX_LIMIT == $dLimit ? $defaultMarker : '';
+
+  // Autosave
+  $dAutoSave = $G_AUTOSAVE_HTML == $dAutoSave ? $defaultMarker : '';
+  $cAutoSave = $G_AUTOSAVE_HTML ? 'Yes' : 'No';
+
+  // Save As Template
+  $dSaveAs = $G_SAVE_HTML_AS == $dSaveAs ? $defaultMarker : '';
+
+  // Prompt to Save
+  $dSavePrompt = $G_PROMPT_TO_SAVE == $dSavePrompt ? $defaultMarker : '';
+  $cSavePrompt = $G_PROMPT_TO_SAVE ? 'Yes' : 'No';
+
+  Text <<<TEXT
+Current GPX Viewer Settings
+
+Window Width: $cWidth$dWidth
+Window Height: $cHeight$dHeight
+
+GPX Limit: $G_GPX_LIMIT$dLimit
+
+Prompt to Save HTML: $cSavePrompt$dSavePrompt
+Autosave HTML: $cAutoSave$dAutoSave
+Save HTML As: $G_SAVE_HTML_AS$dSaveAs
+TEXT;
+/*********************************************************** END _showOptions */
+
+
+"- : _-" //---------------------------------------------------------------------
+
+
+/*******************************************************************************
+** Adjust GPX File Count
+**   Allows user to configure the cap on the maximum number of GPX files which
+**   will be viewed.
+*******************************************************************************/
+"Adjust &Maximum GPX File Count : _adjustCap"
+  // Get default value.
+  Sub '_getDefaults';
+  Global $G_GPX_LIMIT;
+
+  // Get current value.
+  if  (   IsSet($P_THEQWERTY_GPX_VIEWER__GPX_LIMIT)
+        && '' != $P_THEQWERTY_GPX_VIEWER__GPX_LIMIT
+      )
+  {
+    $limit = $P_THEQWERTY_GPX_VIEWER__GPX_LIMIT;
+  } else {
+    $limit = $G_GPX_LIMIT;
+  }
+
+  // Prompt user.
+  $limit = Input('Maximum Number of GPX Files to View', "Default value is $G_GPX_LIMIT.", $limit, 's');
+
+  // Validate
+  $limit = RegexReplace($limit, '[^0-9]');
+
+  // Update stored value.
+  if ($limit == '' || $limit == $G_GPX_LIMIT || $limit < 1) {
+    unset $P_THEQWERTY_GPX_VIEWER__GPX_LIMIT;
+    Status 'Set GPX limit to default: ' . $G_GPX_LIMIT,, 'ready';
+  } else {
+    perm $P_THEQWERTY_GPX_VIEWER__GPX_LIMIT = $limit;
+    Status 'Set GPX limit to: ' . $limit,, 'ready';
+  }
+/************************************************************* END _adjustCap */
+
+
+/*******************************************************************************
+** Adjust Autosave HTML
+**   Allows user to configure whether or not they are prompted to save the
+**   generated HTML.
+*******************************************************************************/
+"Adjust &Autosave HTML : _adjustAutosave"
+	// Get default value.
+	Sub '_getDefaults';
+	Global $G_AUTOSAVE_HTML;
+	$def = $G_AUTOSAVE_HTML ? 'Yes' : 'No';
+
+	// Get current value.
+	if	(		IsSet($P_THEQWERTY_GPX_VIEWER__AUTOSAVE_HTML)
+				&& '' != $P_THEQWERTY_GPX_VIEWER__AUTOSAVE_HTML
+			)
+	{
+		$value = $P_THEQWERTY_GPX_VIEWER__AUTOSAVE_HTML;
+	} else {
+		$value = $G_AUTOSAVE_HTML;
+	}
+	$value = $value ? 'Yes' : 'No';
+
+	// Prompt user.
+	$value = Confirm(<<<MSG
+Would you like the script to automatically save the generated HTML?
+
+Default value is '$def'.
+Current value is '$value'.
+MSG
+	,, ($value == 'Yes' ? 1 : 2), 3);
+
+	End $value == 2;
+
+	// Reduce to true/false
+	$value = $value == 1;
+
+	// Update stored value.
+	if ($value == $G_AUTOSAVE_HTML) {
+		unset $P_THEQWERTY_GPX_VIEWER__AUTOSAVE_HTML;
+		Status 'Set autosave to default: ' . ($G_AUTOSAVE_HTML ? 'Yes' : 'No'),, 'ready';
+	} else {
+		perm $P_THEQWERTY_GPX_VIEWER__AUTOSAVE_HTML = $value;
+		Status 'Set autosave to: ' . ($value ? 'Yes' : 'No'),, 'ready';
+	}
+/******************************************************** END _adjustAutosave */
+
+
+/*******************************************************************************
+** Adjust HTML File Template
+**   Allows user to configure the path & name of the saved HTML file.
+*******************************************************************************/
+"Adjust &HTML File Template : _adjustHTMLTemplate"
+	// Get default value.
+	Sub '_getDefaults';
+	Global $G_SAVE_HTML_AS;
+
+	// Get current value
+	if	(		IsSet($P_THEQWERTY_GPX_VIEWER__SAVE_HTML_AS)
+				&& '' != $P_THEQWERTY_GPX_VIEWER__SAVE_HTML_AS
+			)
+	{
+		$value = $P_THEQWERTY_GPX_VIEWER__SAVE_HTML_AS;
+	} else {
+		$value = $G_SAVE_HTML_AS;
+	}
+
+	$notes = <<<NOTES
+This is the path & name of the file created when the script is configured to
+automatically save the generated HTML.
+
+This may contain XY variables and will be resolved relative to the current path.
+
+Default value is: '$G_SAVE_HTML_AS'.
+NOTES;
+
+	// Prompt user.
+	$value = Input('HTML File Name', $notes, $value, 's');
+
+	// Update stored value.
+	if ($value == '' || $value == $G_SAVE_HTML_AS) {
+		unset $P_THEQWERTY_GPX_VIEWER__SAVE_HTML_AS;
+		Status 'Set HTML file template to default: ' . $G_SAVE_HTML_AS,, 'ready';
+	} else {
+		perm $P_THEQWERTY_GPX_VIEWER__SAVE_HTML_AS = $value;
+		Status 'Set HTML file template to: ' . $value,, 'ready';
+	}
+/**************************************************** END _adjustHTMLTemplate */
+
+
+/*******************************************************************************
+** Adjust Prompt to Save
+**   Allows user to configure whether or not they are prompted to save the
+**   generated HTML.
+*******************************************************************************/
+"Adjust &Prompt to Save : _adjustSavePrompt"
+	// Get default value.
+	Sub '_getDefaults';
+	Global $G_PROMPT_TO_SAVE;
+	$def = $G_PROMPT_TO_SAVE ? 'Yes' : 'No';
+
+	// Get current value.
+	if	(		IsSet($P_THEQWERTY_GPX_VIEWER__PROMPT_TO_SAVE_HTML)
+				&& '' != $P_THEQWERTY_GPX_VIEWER__PROMPT_TO_SAVE_HTML
+			)
+	{
+		$value = $P_THEQWERTY_GPX_VIEWER__PROMPT_TO_SAVE_HTML;
+	} else {
+		$value = $G_PROMPT_TO_SAVE;
+	}
+	$value = $value ? 'Yes' : 'No';
+
+	// Prompt user.
+	$value = Confirm(<<<MSG
+Would you like to be prompted to saved the generated HTML?
+
+Note that autosave is disabled when prompting is enabled.
+
+Default value is '$def'.
+Current value is '$value'.
+MSG
+	,, ($value == 'Yes' ? 1 : 2), 3);
+
+	End $value == 2;
+
+	// Reduce to true/false
+	$value = $value == 1;
+
+	// Update stored value.
+	if ($value == $G_PROMPT_TO_SAVE) {
+		unset $P_THEQWERTY_GPX_VIEWER__PROMPT_TO_SAVE_HTML;
+		Status 'Set prompt to save to default: ' . ($G_PROMPT_TO_SAVE ? 'Yes' : 'No'),, 'ready';
+	} else {
+		perm $P_THEQWERTY_GPX_VIEWER__PROMPT_TO_SAVE_HTML = $value;
+		Status 'Set prompt to save to: ' . ($value ? 'Yes' : 'No'),, 'ready';
+	}
+/****************************************************** END _adjustSavePrompt */
+
+
+/*******************************************************************************
+** Adjust Window Size
+**   Allows user to configure the size of the viewer window.
+*******************************************************************************/
+"Adjust &Window Size : _adjustSize"
+  // Get default value.
+  Sub '_getDefaults';
+  Global $G_WINDOW_SIZE;
+
+  // Get current value.
+  if  (   IsSet($P_THEQWERTY_GPX_VIEWER__WINDOW_SIZE)
+        && '' != $P_THEQWERTY_GPX_VIEWER__WINDOW_SIZE
+      )
+  {
+    $size = $P_THEQWERTY_GPX_VIEWER__WINDOW_SIZE;
+  } else {
+    $size = $G_WINDOW_SIZE;
+  }
+
+  // Prompt user.
+  $size = Input('Viewer Window Size', <<<MSG
+Width x Height of Viewer Window in pixels.
+Percentages of screen are also supported.
+Default value is $G_WINDOW_SIZE.
+MSG
+  , $size, 's');
+
+  // Validate.
+  $size = RegexReplace($size, '[^0-9x%]');
+
+  // Update stored value.
+  if ($size == '' || $size == $G_WINDOW_SIZE || $size UnLikeI '*x*') {
+    unset $P_THEQWERTY_GPX_VIEWER__WINDOW_SIZE;
+    Status 'Set window size to default: ' . $G_WINDOW_SIZE,, 'ready';
+  } else {
+    perm $P_THEQWERTY_GPX_VIEWER__WINDOW_SIZE = $size;
+    Status 'Set window size to: ' . $size,, 'ready';
+  }
+/************************************************************ END _adjustSize */
+
+
+"- : _-" //---------------------------------------------------------------------
+
+
+/*******************************************************************************
+** Reset All to Defaults
+**   Resets all configuration options to their defaults.
+*******************************************************************************/
+"&Reset All to Defaults : _resetToDefaults"
+  unset $P_THEQWERTY_GPX_VIEWER__GPX_LIMIT;
+  unset $P_THEQWERTY_GPX_VIEWER__WINDOW_SIZE;
+  unset $P_THEQWERTY_GPX_VIEWER__AUTOSAVE_HTML;
+  unset $P_THEQWERTY_GPX_VIEWER__SAVE_HTML_AS;
+  unset $P_THEQWERTY_GPX_VIEWER__PROMPT_TO_SAVE_HTML;
+  Status 'Set all options to their defaults.',, 'ready';
+/******************************************************* END _resetToDefaults */
+
+
+"_-" //-------------------------------------------------------------------------
+"_-" //-------------------------------------------------------------------------
+
+
+/*******************************************************************************
+** _getDefaults
+**   Retrieves the default configuration options.
+*******************************************************************************/
+"_getDefaults"
+	Global $G_GPX_LIMIT = 5;
+	Global $G_WINDOW_SIZE = '650 x 800';
+	Global $G_AUTOSAVE_HTML = false;
+	Global $G_SAVE_HTML_AS = 'GPXViewer-<date yyyymmddhhnnss>.html';
+	Global $G_PROMPT_TO_SAVE = false;
+/*********************************************************** END _getDefaults */
+
+
+/*******************************************************************************
+** _getOptions
+**   Retrieves the current configuration options.
+*******************************************************************************/
+"_getOptions"
+	// Get defaults.
+	Sub '_getDefaults';
+
+	// Upper limit on the number of GPX files to view at once.
+	if	(		IsSet($P_THEQWERTY_GPX_VIEWER__GPX_LIMIT)
+				&& '' != $P_THEQWERTY_GPX_VIEWER__GPX_LIMIT
+			)
+	{
+		Global $G_GPX_LIMIT = $P_THEQWERTY_GPX_VIEWER__GPX_LIMIT;
+	}
+
+	// Window Size.
+	if	(		IsSet($P_THEQWERTY_GPX_VIEWER__WINDOW_SIZE)
+				&& '' != $P_THEQWERTY_GPX_VIEWER__WINDOW_SIZE
+			)
+	{
+		Global $G_WINDOW_SIZE = $P_THEQWERTY_GPX_VIEWER__WINDOW_SIZE;
+	}
+
+	// Autosave HTML
+	if	(		IsSet($P_THEQWERTY_GPX_VIEWER__AUTOSAVE_HTML)
+				&& '' != $P_THEQWERTY_GPX_VIEWER__AUTOSAVE_HTML
+			)
+	{
+		Global $G_AUTOSAVE_HTML = $P_THEQWERTY_GPX_VIEWER__AUTOSAVE_HTML;
+	}
+
+	// Save HTML As
+	if	(		IsSet($P_THEQWERTY_GPX_VIEWER__SAVE_HTML_AS)
+				&& '' != $P_THEQWERTY_GPX_VIEWER__SAVE_HTML_AS
+			)
+	{
+		Global $G_SAVE_HTML_AS = $P_THEQWERTY_GPX_VIEWER__SAVE_HTML_AS;
+	}
+
+	// Prompt to Save
+	if	(		IsSet($P_THEQWERTY_GPX_VIEWER__PROMPT_TO_SAVE_HTML)
+				&& '' != $P_THEQWERTY_GPX_VIEWER__PROMPT_TO_SAVE_HTML
+			)
+	{
+		Global $G_PROMPT_TO_SAVE = $P_THEQWERTY_GPX_VIEWER__PROMPT_TO_SAVE_HTML;
+	}
+/************************************************************ END _getOptions */
